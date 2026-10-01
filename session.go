@@ -1,0 +1,71 @@
+package auth
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+type sessionClaims struct {
+	Email       string   `json:"email,omitempty"`
+	Permissions []string `json:"permissions"`
+	jwt.RegisteredClaims
+}
+
+// CheckAuth returns the user of the request's session cookie, if it holds a valid session.
+func (a *Authenticator) CheckAuth(r *http.Request) (AuthInfo, bool) {
+	cookie, err := r.Cookie(a.config.SessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return AuthInfo{}, false
+	}
+
+	var claims sessionClaims
+	if err := a.parseToken(cookie.Value, &claims); err != nil || claims.Subject == "" {
+		return AuthInfo{}, false
+	}
+
+	return AuthInfo{
+		User:        claims.Subject,
+		Email:       claims.Email,
+		Permissions: claims.Permissions,
+	}, true
+}
+
+func (a *Authenticator) createSessionToken(info AuthInfo) (string, error) {
+	now := time.Now()
+	return a.signToken(sessionClaims{
+		Email:       info.Email,
+		Permissions: info.Permissions,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   info.User,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(a.config.SessionDuration)),
+		},
+	})
+}
+
+func (a *Authenticator) signToken(claims jwt.Claims) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.config.SessionSecretKey))
+}
+
+func (a *Authenticator) parseToken(token string, claims jwt.Claims) error {
+	_, err := jwt.ParseWithClaims(token, claims,
+		func(*jwt.Token) (any, error) { return []byte(a.config.SessionSecretKey), nil },
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithExpirationRequired(),
+	)
+	return err
+}
+
+func (a *Authenticator) setCookie(w http.ResponseWriter, name, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   a.secureCookies,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
