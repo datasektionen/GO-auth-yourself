@@ -44,28 +44,3 @@ func (a *Authenticator) createSessionToken(info AuthInfo) (string, error) {
 		},
 	})
 }
-
-func (a *Authenticator) signToken(claims jwt.Claims) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.config.SessionSecretKey))
-}
-
-func (a *Authenticator) parseToken(token string, claims jwt.Claims) error {
-	_, err := jwt.ParseWithClaims(token, claims,
-		func(*jwt.Token) (any, error) { return []byte(a.config.SessionSecretKey), nil },
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
-		jwt.WithExpirationRequired(),
-	)
-	return err
-}
-
-func (a *Authenticator) setCookie(w http.ResponseWriter, name, value string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     name,
-		Value:    value,
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		Secure:   a.secureCookies,
-		SameSite: http.SameSiteLaxMode,
-	})
-}

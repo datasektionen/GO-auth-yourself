@@ -5,12 +5,14 @@ package auth
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/oauth2"
 )
 
@@ -104,4 +106,30 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 		verifier:      provider.Verifier(&oidc.Config{ClientID: cfg.ClientID}),
 		secureCookies: strings.HasPrefix(cfg.RedirectURL, "https://"),
 	}, nil
+}
+
+// signToken and parseToken are shared by session and state tokens.
+func (a *Authenticator) signToken(claims jwt.Claims) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.config.SessionSecretKey))
+}
+
+func (a *Authenticator) parseToken(token string, claims jwt.Claims) error {
+	_, err := jwt.ParseWithClaims(token, claims,
+		func(*jwt.Token) (any, error) { return []byte(a.config.SessionSecretKey), nil },
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithExpirationRequired(),
+	)
+	return err
+}
+
+func (a *Authenticator) setCookie(w http.ResponseWriter, name, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   a.secureCookies,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
