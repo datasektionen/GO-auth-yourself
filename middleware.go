@@ -10,15 +10,15 @@ import (
 // request has a valid session. Anonymous requests pass through unchanged.
 func (a *Authenticator) SessionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if info, ok := a.CheckAuth(r); ok {
-			r = r.WithContext(ContextWithAuth(r.Context(), info))
+		if info, ok := a.readSession(r); ok {
+			r = r.WithContext(ContextWithUser(r.Context(), info))
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// RequireAuth only lets logged-in users through. See RequirePermissions.
-func (a *Authenticator) RequireAuth(next http.Handler) http.Handler {
+// RequireLogin only lets logged-in users through. See RequirePermissions.
+func (a *Authenticator) RequireLogin(next http.Handler) http.Handler {
 	return a.RequirePermissions()(next)
 }
 
@@ -28,17 +28,17 @@ func (a *Authenticator) RequireAuth(next http.Handler) http.Handler {
 func (a *Authenticator) RequirePermissions(perms ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			info, ok := a.CheckAuth(r)
+			info, ok := a.readSession(r)
 			if !ok {
 				denyAnonymous(w, r)
 				return
 			}
 			if len(perms) > 0 && !info.HasAnyPermission(perms...) {
-				slog.Warn("access denied: missing permissions", "user", info.User, "required", perms, "path", r.URL.Path)
+				slog.Warn("access denied: missing permissions", "user", info.Username, "required", perms, "path", r.URL.Path)
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(ContextWithAuth(r.Context(), info)))
+			next.ServeHTTP(w, r.WithContext(ContextWithUser(r.Context(), info)))
 		})
 	}
 }
@@ -50,7 +50,7 @@ func denyAnonymous(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loginURL := LoginPath
-	if ret := sanitizeReturnURL(r.URL.RequestURI()); ret != "/" {
+	if ret := sanitizeReturnPath(r.URL.RequestURI()); ret != "/" {
 		loginURL += "?return_to=" + url.QueryEscape(ret)
 	}
 	http.Redirect(w, r, loginURL, http.StatusFound)

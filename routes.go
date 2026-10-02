@@ -24,7 +24,7 @@ func (a *Authenticator) MountAuthRoutes(mux *http.ServeMux) {
 }
 
 func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
-	state, err := a.createState(sanitizeReturnURL(r.URL.Query().Get("return_to")))
+	state, err := a.createState(sanitizeReturnPath(r.URL.Query().Get("return_to")))
 	if err != nil {
 		slog.Error("failed to create OAuth state", "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -74,34 +74,36 @@ func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.setCookie(w, a.config.SessionCookieName, token, int(a.config.SessionDuration.Seconds()))
-	http.Redirect(w, r, sanitizeReturnURL(returnTo), http.StatusSeeOther)
+	// returnTo was sanitized in handleLogin and is protected by the state signature.
+	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
 
+// Only clears the local session; the user stays logged in at the SSO provider.
 func (a *Authenticator) handleLogout(w http.ResponseWriter, r *http.Request) {
 	a.setCookie(w, a.config.SessionCookieName, "", -1)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // exchangeCode trades an authorization code for a verified ID token and returns its user.
-func (a *Authenticator) exchangeCode(ctx context.Context, code string) (AuthInfo, error) {
+func (a *Authenticator) exchangeCode(ctx context.Context, code string) (User, error) {
 	token, err := a.oauth2Config.Exchange(ctx, code)
 	if err != nil {
-		return AuthInfo{}, fmt.Errorf("token exchange failed: %w", err)
+		return User{}, fmt.Errorf("token exchange failed: %w", err)
 	}
 
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
-		return AuthInfo{}, fmt.Errorf("token response has no id_token")
+		return User{}, fmt.Errorf("token response has no id_token")
 	}
 
 	idToken, err := a.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return AuthInfo{}, fmt.Errorf("failed to verify id_token: %w", err)
+		return User{}, fmt.Errorf("failed to verify id_token: %w", err)
 	}
 
 	var claims json.RawMessage
 	if err := idToken.Claims(&claims); err != nil {
-		return AuthInfo{}, fmt.Errorf("failed to read id_token claims: %w", err)
+		return User{}, fmt.Errorf("failed to read id_token claims: %w", err)
 	}
 	return parseIDTokenClaims(claims)
 }

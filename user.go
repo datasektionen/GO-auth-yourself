@@ -10,7 +10,7 @@ import (
 // User is the identity and permissions of a logged-in user.
 // The zero value represents an anonymous user with no permissions.
 type User struct {
-	Username        string
+	Username    string
 	Email       string
 	Permissions []Permission
 }

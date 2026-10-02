@@ -15,7 +15,8 @@ const (
 )
 
 // stateClaims carries the post-login destination through the OAuth round trip.
-// The typ claim keeps session tokens from being accepted as state and vice versa.
+// The typ claim keeps session tokens from being accepted as state. State tokens
+// are rejected as sessions because they have no subject.
 type stateClaims struct {
 	Type     string `json:"typ"`
 	Nonce    string `json:"nonce"`
@@ -45,11 +46,11 @@ func (a *Authenticator) parseState(token string) (returnTo string, err error) {
 	return claims.ReturnTo, nil
 }
 
-// sanitizeReturnURL only allows local paths, preventing open redirects.
-func sanitizeReturnURL(target string) string {
+// sanitizeReturnPath only allows local paths, preventing open redirects.
+func sanitizeReturnPath(target string) string {
 	if !strings.HasPrefix(target, "/") ||
 		strings.HasPrefix(target, "//") ||
-		strings.HasPrefix(target, "/\\") ||
+		strings.HasPrefix(target, "/\\") || // browsers treat /\ like //
 		strings.ContainsAny(target, "\r\n") {
 		return "/"
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,11 +36,11 @@ func newTestProvider(t *testing.T) string {
 
 func testConfig(t *testing.T) Config {
 	return Config{
-		ProviderURL:      newTestProvider(t),
-		ClientID:         "client-id",
-		ClientSecret:     "client-secret",
-		RedirectURL:      "http://localhost:3000/auth/callback",
-		SessionSecretKey: testSecret,
+		ProviderURL:  newTestProvider(t),
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		RedirectURL:  "http://localhost:3000/auth/callback",
+		SecretKey:    testSecret,
 	}
 }
 
@@ -52,7 +53,7 @@ func newTestAuthenticator(t *testing.T) *Authenticator {
 	return a
 }
 
-func sessionCookie(t *testing.T, a *Authenticator, info AuthInfo) *http.Cookie {
+func sessionCookie(t *testing.T, a *Authenticator, info User) *http.Cookie {
 	t.Helper()
 	token, err := a.createSessionToken(info)
 	if err != nil {
@@ -71,9 +72,10 @@ func TestNewValidatesConfig(t *testing.T) {
 	tests := map[string]func(*Config){
 		"missing provider":      func(c *Config) { c.ProviderURL = "" },
 		"missing client id":     func(c *Config) { c.ClientID = "" },
+		"missing client secret": func(c *Config) { c.ClientSecret = "" },
 		"missing redirect url":  func(c *Config) { c.RedirectURL = "" },
 		"relative redirect url": func(c *Config) { c.RedirectURL = "/auth/callback" },
-		"short secret":          func(c *Config) { c.SessionSecretKey = "short" },
+		"short secret":          func(c *Config) { c.SecretKey = "short" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -135,7 +137,7 @@ func TestCallbackValidatesState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := sessionCookie(t, a, AuthInfo{User: "turetek"}).Value
+	session := sessionCookie(t, a, User{Username: "turetek"}).Value
 
 	tests := []struct {
 		name, state, cookie, code string
@@ -181,14 +183,14 @@ func TestLogoutClearsSession(t *testing.T) {
 	}
 }
 
-func TestCheckAuth(t *testing.T) {
+func TestReadSession(t *testing.T) {
 	a := newTestAuthenticator(t)
-	want := AuthInfo{User: "turetek", Email: "turetek@kth.se", Permissions: []string{"admin"}}
+	want := User{Username: "turetek", Email: "turetek@kth.se", Permissions: []Permission{{ID: "admin"}}}
 
 	expired := *a
 	expired.config.SessionDuration = -time.Hour
 	otherKey := *a
-	otherKey.config.SessionSecretKey = strings.Repeat("x", MinSecretKeyLength)
+	otherKey.config.SecretKey = strings.Repeat("x", MinSecretKeyLength)
 	state, _ := a.createState("/")
 	unsigned, _ := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
 		"sub": "turetek", "exp": time.Now().Add(time.Hour).Unix(),
@@ -204,19 +206,19 @@ func TestCheckAuth(t *testing.T) {
 	for name, token := range invalid {
 		req := httptest.NewRequest("GET", "/", nil)
 		req.AddCookie(&http.Cookie{Name: "session", Value: token})
-		if _, ok := a.CheckAuth(req); ok {
+		if _, ok := a.readSession(req); ok {
 			t.Errorf("%s: expected rejection", name)
 		}
 	}
 
-	if _, ok := a.CheckAuth(httptest.NewRequest("GET", "/", nil)); ok {
+	if _, ok := a.readSession(httptest.NewRequest("GET", "/", nil)); ok {
 		t.Error("expected no session without cookie")
 	}
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(sessionCookie(t, a, want))
-	got, ok := a.CheckAuth(req)
-	if !ok || got.User != want.User || got.Email != want.Email || !got.HasPermission("admin") {
+	got, ok := a.readSession(req)
+	if !ok || got.Username != want.Username || got.Email != want.Email || !got.HasPermission("admin") {
 		t.Errorf("got %+v (ok=%v), want %+v", got, ok, want)
 	}
 }
@@ -227,7 +229,7 @@ func TestSessionMiddleware(t *testing.T) {
 	var gotOK bool
 	h := a.SessionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		info, ok := FromContext(r.Context())
-		gotUser, gotOK = info.User, ok
+		gotUser, gotOK = info.Username, ok
 	}))
 
 	serve(h, httptest.NewRequest("GET", "/", nil))
@@ -236,7 +238,7 @@ func TestSessionMiddleware(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/", nil)
-	req.AddCookie(sessionCookie(t, a, AuthInfo{User: "turetek"}))
+	req.AddCookie(sessionCookie(t, a, User{Username: "turetek"}))
 	serve(h, req)
 	if !gotOK || gotUser != "turetek" {
 		t.Errorf("expected turetek in context, got %q (ok=%v)", gotUser, gotOK)
@@ -250,8 +252,8 @@ func TestRequirePermissions(t *testing.T) {
 			t.Error("protected handler ran without user in context")
 		}
 	})
-	admin := sessionCookie(t, a, AuthInfo{User: "turetek", Permissions: []string{"admin"}})
-	viewer := sessionCookie(t, a, AuthInfo{User: "diadat", Permissions: []string{"view-all"}})
+	admin := sessionCookie(t, a, User{Username: "turetek", Permissions: []Permission{{ID: "admin"}}})
+	viewer := sessionCookie(t, a, User{Username: "diadat", Permissions: []Permission{{ID: "view-all"}}})
 
 	tests := []struct {
 		name         string
@@ -262,12 +264,12 @@ func TestRequirePermissions(t *testing.T) {
 		wantLocation string
 	}{
 		{"anonymous GET redirects", a.RequirePermissions("admin")(ok), "GET", "/admin?tab=1", nil, http.StatusFound, "/login?return_to=%2Fadmin%3Ftab%3D1"},
-		{"anonymous GET of root", a.RequireAuth(ok), "GET", "/", nil, http.StatusFound, "/login"},
+		{"anonymous GET of root", a.RequireLogin(ok), "GET", "/", nil, http.StatusFound, "/login"},
 		{"anonymous POST is 401", a.RequirePermissions("admin")(ok), "POST", "/admin/items", nil, http.StatusUnauthorized, ""},
 		{"missing permission is 403", a.RequirePermissions("admin")(ok), "GET", "/admin", viewer, http.StatusForbidden, ""},
 		{"any listed permission passes", a.RequirePermissions("admin", "view-all")(ok), "GET", "/admin", viewer, http.StatusOK, ""},
 		{"admin passes", a.RequirePermissions("admin")(ok), "POST", "/admin/items", admin, http.StatusOK, ""},
-		{"RequireAuth passes any user", a.RequireAuth(ok), "GET", "/", viewer, http.StatusOK, ""},
+		{"RequireLogin passes any user", a.RequireLogin(ok), "GET", "/", viewer, http.StatusOK, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -283,7 +285,7 @@ func TestRequirePermissions(t *testing.T) {
 	}
 }
 
-func TestSanitizeReturnURL(t *testing.T) {
+func TestSanitizeReturnPath(t *testing.T) {
 	tests := map[string]string{
 		"":                     "/",
 		"/":                    "/",
@@ -295,8 +297,8 @@ func TestSanitizeReturnURL(t *testing.T) {
 		"/ok\r\nSet-Cookie: x": "/",
 	}
 	for in, want := range tests {
-		if got := sanitizeReturnURL(in); got != want {
-			t.Errorf("sanitizeReturnURL(%q) = %q, want %q", in, got, want)
+		if got := sanitizeReturnPath(in); got != want {
+			t.Errorf("sanitizeReturnPath(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -306,15 +308,15 @@ func TestParseIDTokenClaims(t *testing.T) {
 		name      string
 		claims    string
 		wantUser  string
-		wantPerms []string
+		wantPerms []Permission
 		wantErr   bool
 	}{
-		{"string permissions", `{"preferred_username":"diadat","email":"diadat@kth.se","permissions":["view-all"]}`, "diadat", []string{"view-all"}, false},
-		{"object permissions", `{"preferred_username":"turetek","permissions":[{"id":"admin","scope":""},{"id":"editor"}]}`, "turetek", []string{"admin", "editor"}, false},
+		{"hive permissions", `{"preferred_username":"turetek","email":"turetek@kth.se","permissions":[{"id":"admin","scope":null},{"id":"write","scope":"/central"}]}`, "turetek", []Permission{{ID: "admin"}, {ID: "write", Scope: "/central"}}, false},
 		{"null permissions", `{"preferred_username":"turetek","permissions":null}`, "turetek", nil, false},
 		{"falls back to email", `{"email":"turetek@kth.se","sub":"x"}`, "turetek@kth.se", nil, false},
 		{"falls back to sub", `{"sub":"kth-id-1"}`, "kth-id-1", nil, false},
-		{"no user", `{"permissions":["admin"]}`, "", nil, true},
+		{"no user", `{"permissions":[{"id":"admin"}]}`, "", nil, true},
+		{"string permissions", `{"sub":"x","permissions":["admin"]}`, "", nil, true},
 		{"bad permissions", `{"sub":"x","permissions":"admin"}`, "", nil, true},
 	}
 	for _, tt := range tests {
@@ -323,18 +325,27 @@ func TestParseIDTokenClaims(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
-			if info.User != tt.wantUser || strings.Join(info.Permissions, ",") != strings.Join(tt.wantPerms, ",") {
+			if info.Username != tt.wantUser || !slices.Equal(info.Permissions, tt.wantPerms) {
 				t.Errorf("got %+v, want user %q perms %v", info, tt.wantUser, tt.wantPerms)
 			}
 		})
 	}
 }
 
-func TestAuthInfoPermissions(t *testing.T) {
-	info := AuthInfo{User: "turetek", Permissions: []string{"admin", "editor"}}
+func TestUserPermissions(t *testing.T) {
+	info := User{Username: "turetek", Permissions: []Permission{
+		{ID: "admin"},
+		{ID: "editor"},
+		{ID: "attest", Scope: "*"},
+		{ID: "write", Scope: "/central"},
+	}}
 
-	if !info.HasPermission("admin") || info.HasPermission("viewer") {
+	if !info.HasPermission("admin") || !info.HasPermission("attest") || info.HasPermission("write") || info.HasPermission("viewer") {
 		t.Error("HasPermission")
+	}
+	if !info.HasPermissionScope("write", "/central") || !info.HasPermissionScope("attest", "/any") ||
+		info.HasPermissionScope("write", "/other") || info.HasPermissionScope("admin", "/central") {
+		t.Error("HasPermissionScope")
 	}
 	if !info.HasAnyPermission("viewer", "editor") || info.HasAnyPermission("viewer", "root") || info.HasAnyPermission() {
 		t.Error("HasAnyPermission")
@@ -342,8 +353,11 @@ func TestAuthInfoPermissions(t *testing.T) {
 	if !info.HasAllPermissions("admin", "editor") || info.HasAllPermissions("admin", "root") {
 		t.Error("HasAllPermissions")
 	}
-	if (AuthInfo{}).HasAnyPermission("admin") {
+	if (User{}).HasAnyPermission("admin") {
 		t.Error("anonymous user should have no permissions")
+	}
+	if got := (Permission{ID: "write", Scope: "/central"}).String(); got != "write:/central" {
+		t.Errorf("String() = %q", got)
 	}
 }
 
@@ -351,11 +365,11 @@ func TestFromContext(t *testing.T) {
 	if _, ok := FromContext(context.Background()); ok {
 		t.Error("empty context should not have a user")
 	}
-	if _, ok := FromContext(ContextWithAuth(context.Background(), AuthInfo{})); ok {
-		t.Error("AuthInfo without user should not count as logged in")
+	if _, ok := FromContext(ContextWithUser(context.Background(), User{})); ok {
+		t.Error("User without username should not count as logged in")
 	}
-	info, ok := FromContext(ContextWithAuth(context.Background(), AuthInfo{User: "turetek"}))
-	if !ok || info.User != "turetek" {
+	info, ok := FromContext(ContextWithUser(context.Background(), User{Username: "turetek"}))
+	if !ok || info.Username != "turetek" {
 		t.Errorf("got %+v (ok=%v)", info, ok)
 	}
 }

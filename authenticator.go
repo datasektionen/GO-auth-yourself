@@ -16,7 +16,7 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// MinSecretKeyLength is the minimum accepted length of Config.SessionSecretKey in bytes.
+// MinSecretKeyLength is the minimum accepted length of Config.SecretKey in bytes.
 const MinSecretKeyLength = 32
 
 // Config configures an Authenticator.
@@ -25,7 +25,7 @@ type Config struct {
 	ClientID          string        // OAuth2 client ID
 	ClientSecret      string        // OAuth2 client secret
 	RedirectURL       string        // Absolute URL that routes to CallbackPath
-	SessionSecretKey  string        // Signs session and state tokens, at least MinSecretKeyLength bytes
+	SecretKey         string        // Signs session and state tokens, at least MinSecretKeyLength bytes
 	SessionCookieName string        // Default "session"
 	StateCookieName   string        // Default "oauth_state"
 	SessionDuration   time.Duration // Default 7 days
@@ -35,11 +35,11 @@ type Config struct {
 // OIDC_REDIRECT_URL and APP_SECRET_KEY. Validation happens in New.
 func ConfigFromEnv() Config {
 	return Config{
-		ProviderURL:      os.Getenv("OIDC_PROVIDER"),
-		ClientID:         os.Getenv("OIDC_CLIENT_ID"),
-		ClientSecret:     os.Getenv("OIDC_CLIENT_SECRET"),
-		RedirectURL:      os.Getenv("OIDC_REDIRECT_URL"),
-		SessionSecretKey: os.Getenv("APP_SECRET_KEY"),
+		ProviderURL:  os.Getenv("OIDC_PROVIDER"),
+		ClientID:     os.Getenv("OIDC_CLIENT_ID"),
+		ClientSecret: os.Getenv("OIDC_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("OIDC_REDIRECT_URL"),
+		SecretKey:    os.Getenv("APP_SECRET_KEY"),
 	}
 }
 
@@ -51,6 +51,9 @@ func (c Config) validate() error {
 	if c.ClientID == "" {
 		missing = append(missing, "ClientID (OIDC_CLIENT_ID)")
 	}
+	if c.ClientSecret == "" {
+		missing = append(missing, "ClientSecret (OIDC_CLIENT_SECRET)")
+	}
 	if c.RedirectURL == "" {
 		missing = append(missing, "RedirectURL (OIDC_REDIRECT_URL)")
 	}
@@ -60,8 +63,8 @@ func (c Config) validate() error {
 	if u, err := url.Parse(c.RedirectURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("RedirectURL (OIDC_REDIRECT_URL) must be an absolute http(s) URL, got %q", c.RedirectURL)
 	}
-	if len(c.SessionSecretKey) < MinSecretKeyLength {
-		return fmt.Errorf("SessionSecretKey (APP_SECRET_KEY) must be at least %d bytes", MinSecretKeyLength)
+	if len(c.SecretKey) < MinSecretKeyLength {
+		return fmt.Errorf("SecretKey (APP_SECRET_KEY) must be at least %d bytes", MinSecretKeyLength)
 	}
 	return nil
 }
@@ -108,14 +111,13 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 	}, nil
 }
 
-// signToken and parseToken are shared by session and state tokens.
 func (a *Authenticator) signToken(claims jwt.Claims) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.config.SessionSecretKey))
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.config.SecretKey))
 }
 
 func (a *Authenticator) parseToken(token string, claims jwt.Claims) error {
 	_, err := jwt.ParseWithClaims(token, claims,
-		func(*jwt.Token) (any, error) { return []byte(a.config.SessionSecretKey), nil },
+		func(*jwt.Token) (any, error) { return []byte(a.config.SecretKey), nil },
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 		jwt.WithExpirationRequired(),
 	)
