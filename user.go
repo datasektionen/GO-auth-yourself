@@ -10,7 +10,8 @@ import (
 // User is the identity and permissions of a logged-in user.
 // The zero value represents an anonymous user with no permissions.
 type User struct {
-	Username    string
+	Username    string // KTH ID, e.g. "turetek"
+	Name        string // Full name, e.g. "Ture Teknolog"
 	Email       string
 	Permissions []Permission
 }
@@ -79,27 +80,20 @@ func FromContext(ctx context.Context) (User, bool) {
 }
 
 // parseIDTokenClaims expects permissions in Hive's format: [{"id": "admin", "scope": null}].
+// The username is sub (the KTH ID); SSO sets preferred_username to the full name.
 func parseIDTokenClaims(claimsJSON []byte) (User, error) {
 	var raw struct {
-		PreferredUsername string       `json:"preferred_username"`
-		Email             string       `json:"email"`
-		Sub               string       `json:"sub"`
-		Permissions       []Permission `json:"permissions"`
+		Sub         string       `json:"sub"`
+		Name        string       `json:"name"`
+		Email       string       `json:"email"`
+		Permissions []Permission `json:"permissions"`
 	}
 	if err := json.Unmarshal(claimsJSON, &raw); err != nil {
 		return User{}, fmt.Errorf("failed to unmarshal ID token claims: %w", err)
 	}
-
-	user := raw.PreferredUsername
-	if user == "" {
-		user = raw.Email
-	}
-	if user == "" {
-		user = raw.Sub
-	}
-	if user == "" {
-		return User{}, fmt.Errorf("ID token has no user identifier")
+	if raw.Sub == "" {
+		return User{}, fmt.Errorf("ID token has no sub claim")
 	}
 
-	return User{Username: user, Email: raw.Email, Permissions: raw.Permissions}, nil
+	return User{Username: raw.Sub, Name: raw.Name, Email: raw.Email, Permissions: raw.Permissions}, nil
 }

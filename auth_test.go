@@ -2,12 +2,17 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,21 +21,71 @@ import (
 
 var testSecret = strings.Repeat("s", MinSecretKeyLength)
 
-// newTestProvider serves a minimal OIDC discovery document so New works offline.
-// Every other path returns the same document, so code exchanges against it fail.
+const testCode = "valid-code"
+
+// Claims the test provider puts in every ID token, shaped like sso.datasektionen.se's.
+var testIDClaims = map[string]any{
+	"sub":                "turetek",
+	"preferred_username": "Ture Teknolog",
+	"name":               "Ture Teknolog",
+	"email":              "turetek@kth.se",
+	"permissions":        []map[string]any{{"id": "admin", "scope": nil}, {"id": "write", "scope": "/central"}},
+}
+
+var testSigningKey = sync.OnceValue(func() *rsa.PrivateKey {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	return key
+})
+
+// newTestProvider runs a minimal OIDC provider that exchanges testCode for a
+// signed ID token with testIDClaims and rejects every other code.
 func newTestProvider(t *testing.T) string {
 	t.Helper()
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	key := testSigningKey()
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	writeJSON := func(w http.ResponseWriter, v any) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(v)
+	}
+	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]string{
 			"issuer":                 srv.URL,
 			"authorization_endpoint": srv.URL + "/auth",
 			"token_endpoint":         srv.URL + "/token",
 			"jwks_uri":               srv.URL + "/jwks",
 		})
-	}))
-	t.Cleanup(srv.Close)
+	})
+	mux.HandleFunc("GET /jwks", func(w http.ResponseWriter, r *http.Request) {
+		b64 := base64.RawURLEncoding.EncodeToString
+		writeJSON(w, map[string]any{"keys": []map[string]string{{
+			"kty": "RSA", "kid": "test", "use": "sig", "alg": "RS256",
+			"n": b64(key.N.Bytes()), "e": b64(big.NewInt(int64(key.E)).Bytes()),
+		}}})
+	})
+	mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
+		if r.FormValue("code") != testCode {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]string{"error": "invalid_grant"})
+			return
+		}
+		claims := jwt.MapClaims{"iss": srv.URL, "aud": "client-id", "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}
+		for k, v := range testIDClaims {
+			claims[k] = v
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		token.Header["kid"] = "test"
+		idToken, err := token.SignedString(key)
+		if err != nil {
+			t.Errorf("sign ID token: %v", err)
+		}
+		writeJSON(w, map[string]any{"access_token": "access", "token_type": "Bearer", "expires_in": 3600, "id_token": idToken})
+	})
 	return srv.URL
 }
 
@@ -140,21 +195,26 @@ func TestCallbackValidatesState(t *testing.T) {
 	session := sessionCookie(t, a, User{Username: "turetek"}).Value
 
 	tests := []struct {
-		name, state, cookie, code string
-		wantCode                  int
-		wantBody                  string
+		name, state, cookie, code, errDescription string
+		wantCode                                  int
+		wantBody                                  string
 	}{
-		{"missing cookie", state, "", "abc", http.StatusBadRequest, "Invalid or missing login state"},
-		{"mismatched cookie", state, "other", "abc", http.StatusBadRequest, "Invalid or missing login state"},
-		{"session token as state", session, session, "abc", http.StatusBadRequest, "expired"},
-		{"cancelled login", state, state, "", http.StatusBadRequest, "cancelled"},
-		{"valid state reaches code exchange", state, state, "abc", http.StatusInternalServerError, "Authentication failed"},
+		{"missing cookie", state, "", "abc", "", http.StatusBadRequest, "Invalid or missing login state"},
+		{"mismatched cookie", state, "other", "abc", "", http.StatusBadRequest, "Invalid or missing login state"},
+		{"session token as state", session, session, "abc", "", http.StatusBadRequest, "expired"},
+		{"cancelled login", state, state, "", "", http.StatusBadRequest, "cancelled"},
+		{"SSO error is shown", state, state, "", "User is not allowed", http.StatusBadRequest, "User is not allowed"},
+		{"code rejected by SSO", state, state, "abc", "", http.StatusInternalServerError, "Authentication failed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			q := url.Values{"state": {tt.state}}
 			if tt.code != "" {
 				q.Set("code", tt.code)
+			}
+			if tt.errDescription != "" {
+				q.Set("error", "access_denied")
+				q.Set("error_description", tt.errDescription)
 			}
 			req := httptest.NewRequest("GET", CallbackPath+"?"+q.Encode(), nil)
 			if tt.cookie != "" {
@@ -165,6 +225,44 @@ func TestCallbackValidatesState(t *testing.T) {
 				t.Errorf("got %d %q, want %d containing %q", rec.Code, rec.Body.String(), tt.wantCode, tt.wantBody)
 			}
 		})
+	}
+}
+
+func TestCallbackLogsIn(t *testing.T) {
+	a := newTestAuthenticator(t)
+	mux := http.NewServeMux()
+	a.MountAuthRoutes(mux)
+
+	state, err := a.createState("/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", CallbackPath+"?"+url.Values{"state": {state}, "code": {testCode}}.Encode(), nil)
+	req.AddCookie(&http.Cookie{Name: "oauth_state", Value: state})
+	rec := serve(mux, req)
+
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/admin" {
+		t.Fatalf("expected 303 to /admin, got %d %q: %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+
+	next := httptest.NewRequest("GET", "/admin", nil)
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "oauth_state" && c.MaxAge >= 0 {
+			t.Error("state cookie was not cleared")
+		}
+		if c.Name == "session" {
+			next.AddCookie(c)
+		}
+	}
+	user, ok := a.readSession(next)
+	want := User{
+		Username:    "turetek",
+		Name:        "Ture Teknolog",
+		Email:       "turetek@kth.se",
+		Permissions: []Permission{{ID: "admin"}, {ID: "write", Scope: "/central"}},
+	}
+	if !ok || user.Username != want.Username || user.Name != want.Name || user.Email != want.Email || !slices.Equal(user.Permissions, want.Permissions) {
+		t.Errorf("session user = %+v (ok=%v), want %+v", user, ok, want)
 	}
 }
 
@@ -185,7 +283,7 @@ func TestLogoutClearsSession(t *testing.T) {
 
 func TestReadSession(t *testing.T) {
 	a := newTestAuthenticator(t)
-	want := User{Username: "turetek", Email: "turetek@kth.se", Permissions: []Permission{{ID: "admin"}}}
+	want := User{Username: "turetek", Name: "Ture Teknolog", Email: "turetek@kth.se", Permissions: []Permission{{ID: "admin"}}}
 
 	expired := *a
 	expired.config.SessionDuration = -time.Hour
@@ -218,7 +316,7 @@ func TestReadSession(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(sessionCookie(t, a, want))
 	got, ok := a.readSession(req)
-	if !ok || got.Username != want.Username || got.Email != want.Email || !got.HasPermission("admin") {
+	if !ok || got.Username != want.Username || got.Name != want.Name || got.Email != want.Email || !got.HasPermission("admin") {
 		t.Errorf("got %+v (ok=%v), want %+v", got, ok, want)
 	}
 }
@@ -311,11 +409,10 @@ func TestParseIDTokenClaims(t *testing.T) {
 		wantPerms []Permission
 		wantErr   bool
 	}{
-		{"hive permissions", `{"preferred_username":"turetek","email":"turetek@kth.se","permissions":[{"id":"admin","scope":null},{"id":"write","scope":"/central"}]}`, "turetek", []Permission{{ID: "admin"}, {ID: "write", Scope: "/central"}}, false},
-		{"null permissions", `{"preferred_username":"turetek","permissions":null}`, "turetek", nil, false},
-		{"falls back to email", `{"email":"turetek@kth.se","sub":"x"}`, "turetek@kth.se", nil, false},
-		{"falls back to sub", `{"sub":"kth-id-1"}`, "kth-id-1", nil, false},
-		{"no user", `{"permissions":[{"id":"admin"}]}`, "", nil, true},
+		{"hive permissions", `{"sub":"turetek","email":"turetek@kth.se","permissions":[{"id":"admin","scope":null},{"id":"write","scope":"/central"}]}`, "turetek", []Permission{{ID: "admin"}, {ID: "write", Scope: "/central"}}, false},
+		{"null permissions", `{"sub":"turetek","permissions":null}`, "turetek", nil, false},
+		{"ignores preferred_username", `{"sub":"turetek","preferred_username":"Ture Teknolog"}`, "turetek", nil, false},
+		{"no sub", `{"preferred_username":"turetek","email":"turetek@kth.se"}`, "", nil, true},
 		{"string permissions", `{"sub":"x","permissions":["admin"]}`, "", nil, true},
 		{"bad permissions", `{"sub":"x","permissions":"admin"}`, "", nil, true},
 	}

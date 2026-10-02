@@ -89,7 +89,7 @@ if user.HasPermission("edit") {
 }
 ```
 
-`User` has `Username` (KTH username), `Email` and `Permissions`, plus `HasPermission`, `HasAnyPermission`, `HasAllPermissions` and `HasPermissionScope`.
+`User` has `Username` (KTH ID, e.g. `turetek`), `Name` (e.g. `Ture Teknolog`), `Email` and `Permissions`, plus `HasPermission`, `HasAnyPermission`, `HasAllPermissions` and `HasPermissionScope`.
 
 - **Scoped permissions**: Hive permissions can be limited to a scope, e.g. `edit` for one budget. `HasPermission("edit")` and `RequirePermissions("edit")` only count `edit` without a scope or with the wildcard scope `*`. Check a specific scope with `user.HasPermissionScope("edit", "budget-2026")`.
 - **In templates**, pass the `User` and call its methods directly: `{{if .auth.HasPermission "admin"}}`. A visitor who isn't logged in has no permissions, so no `loggedIn` check is needed.
@@ -128,7 +128,9 @@ Why it is built this way:
 
 You don't need to read this to use the library.
 
-- Permissions are read from the ID token's `permissions` claim (requested with the `permissions` scope), in Hive's format `[{"id": "admin", "scope": null}]`.
+- The login requests the scopes `openid`, `profile`, `email` and `permissions`. `Username` is the ID token's `sub` (the KTH ID), not `preferred_username`, which SSO sets to the full name.
+- Permissions are read from the ID token's `permissions` claim, in Hive's format `[{"id": "admin", "scope": null}]`.
+- Requests to the SSO time out after 10 seconds.
 - `return_to` only accepts local paths, so it can't be used for open redirects.
 - The OAuth `state` is tied to the browser with a cookie, which prevents login CSRF.
 - Cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` when `OIDC_REDIRECT_URL` uses `https://`.

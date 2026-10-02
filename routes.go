@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+
+	"github.com/coreos/go-oidc/v3/oidc"
 )
 
 // Paths registered by MountAuthRoutes. Config.RedirectURL must route to CallbackPath.
@@ -55,7 +57,13 @@ func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Missing when the user cancels or the provider rejects the request.
 	code := query.Get("code")
 	if code == "" {
-		http.Error(w, "Login was cancelled or denied", http.StatusBadRequest)
+		description := query.Get("error_description")
+		slog.Warn("login rejected by SSO", "error", query.Get("error"), "description", description)
+		msg := "Login was cancelled or denied"
+		if description != "" {
+			msg += ": " + description
+		}
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 
@@ -86,7 +94,7 @@ func (a *Authenticator) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // exchangeCode trades an authorization code for a verified ID token and returns its user.
 func (a *Authenticator) exchangeCode(ctx context.Context, code string) (User, error) {
-	token, err := a.oauth2Config.Exchange(ctx, code)
+	token, err := a.oauth2Config.Exchange(oidc.ClientContext(ctx, a.httpClient), code)
 	if err != nil {
 		return User{}, fmt.Errorf("token exchange failed: %w", err)
 	}

@@ -9,6 +9,7 @@ import (
 
 // Permissions are a snapshot from login; Hive changes apply on next login.
 type sessionClaims struct {
+	Name        string       `json:"name,omitempty"`
 	Email       string       `json:"email,omitempty"`
 	Permissions []Permission `json:"permissions"`
 	jwt.RegisteredClaims
@@ -28,6 +29,7 @@ func (a *Authenticator) readSession(r *http.Request) (User, bool) {
 
 	return User{
 		Username:    claims.Subject,
+		Name:        claims.Name,
 		Email:       claims.Email,
 		Permissions: claims.Permissions,
 	}, true
@@ -36,6 +38,7 @@ func (a *Authenticator) readSession(r *http.Request) (User, bool) {
 func (a *Authenticator) createSessionToken(info User) (string, error) {
 	now := time.Now()
 	return a.signToken(sessionClaims{
+		Name:        info.Name,
 		Email:       info.Email,
 		Permissions: info.Permissions,
 		RegisteredClaims: jwt.RegisteredClaims{

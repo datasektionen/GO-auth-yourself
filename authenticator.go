@@ -19,6 +19,9 @@ import (
 // MinSecretKeyLength is the minimum accepted length of Config.SecretKey in bytes.
 const MinSecretKeyLength = 32
 
+// providerTimeout bounds every request to the SSO: discovery, key fetches and code exchange.
+const providerTimeout = 10 * time.Second
+
 // Config configures an Authenticator.
 type Config struct {
 	ProviderURL       string        // OIDC provider URL, e.g. "https://sso.datasektionen.se/op"
@@ -74,6 +77,7 @@ type Authenticator struct {
 	config        Config
 	oauth2Config  oauth2.Config
 	verifier      *oidc.IDTokenVerifier
+	httpClient    *http.Client
 	secureCookies bool
 }
 
@@ -92,7 +96,8 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 		cfg.SessionDuration = 7 * 24 * time.Hour
 	}
 
-	provider, err := oidc.NewProvider(ctx, cfg.ProviderURL)
+	httpClient := &http.Client{Timeout: providerTimeout}
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, httpClient), cfg.ProviderURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover OIDC provider: %w", err)
 	}
@@ -104,9 +109,10 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 			ClientSecret: cfg.ClientSecret,
 			RedirectURL:  cfg.RedirectURL,
 			Endpoint:     provider.Endpoint(),
-			Scopes:       []string{oidc.ScopeOpenID, "permissions"},
+			Scopes:       []string{oidc.ScopeOpenID, "profile", "email", "permissions"},
 		},
 		verifier:      provider.Verifier(&oidc.Config{ClientID: cfg.ClientID}),
+		httpClient:    httpClient,
 		secureCookies: strings.HasPrefix(cfg.RedirectURL, "https://"),
 	}, nil
 }
